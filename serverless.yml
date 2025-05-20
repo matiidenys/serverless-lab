@@ -1,0 +1,150 @@
+org: chnuedu
+app: aws
+service: serverless-lab
+
+provider:
+  name: aws
+  runtime: nodejs20.x
+  region: eu-north-1 
+
+  iam:
+    role:
+      statements:
+        - Effect: Allow
+          Action:
+            - dynamodb:GetItem
+            - dynamodb:PutItem
+            - dynamodb:UpdateItem
+            - dynamodb:DeleteItem
+            - dynamodb:Scan
+            - dynamodb:Query
+          Resource: "arn:aws:dynamodb:${aws:region}:${aws:accountId}:table/Organizations"
+        - Effect: Allow
+          Action:
+            - dynamodb:GetItem
+            - dynamodb:PutItem
+            - dynamodb:UpdateItem
+            - dynamodb:DeleteItem
+            - dynamodb:Scan
+            - dynamodb:Query
+          Resource: "arn:aws:dynamodb:${aws:region}:${aws:accountId}:table/Users"
+        # Дозвіл для запитів до Global Secondary Index (GSI) OrgId-index
+        - Effect: Allow
+          Action:
+            - dynamodb:Query
+          Resource: "arn:aws:dynamodb:${aws:region}:${aws:accountId}:table/Users/index/OrgId-index"
+
+plugins:
+  - serverless-dynamodb 
+  - serverless-offline
+
+functions:
+  createOrganization:
+    handler: handler.createOrganization
+    events:
+      - httpApi:
+          path: /organizations
+          method: post
+
+  createOrUpdateUser: # Функція для створення та оновлення користувача
+    handler: handler.createOrUpdateUser
+    events:
+      - httpApi:
+          path: /organizations/{orgId}/users
+          method: post
+      - httpApi:
+          path: /organizations/{orgId}/users
+          method: put 
+
+  updateOrganization:
+    handler: handler.updateOrganization
+    events:
+      - httpApi:
+          path: /organizations
+          method: put
+  getOrganization:
+    handler: handler.getOrganization
+    events:
+      - httpApi:
+          path: /organizations/{orgId}
+          method: get
+
+  getUser:
+    handler: handler.getUser
+    events:
+      - httpApi:
+          path: /organizations/{orgId}/users/{userId}
+          method: get
+  getAllOrganizations: 
+    handler: handler.getAllOrganizations
+    events:
+      - httpApi:
+          path: /organizations
+          method: get
+  getAllUsersByOrganization:
+    handler: handler.getAllUsersByOrganization
+    events:
+      - httpApi:
+          path: /organizations/{orgId}/users
+          method: get
+
+# Конфігурація DynamoDB таблиць для локального використання та розгортання
+resources:
+  Resources:
+    OrganizationsTable:
+      Type: AWS::DynamoDB::Table
+      Properties:
+        TableName: Organizations
+        AttributeDefinitions:
+          - AttributeName: orgId
+            AttributeType: S
+        KeySchema:
+          - AttributeName: orgId
+            KeyType: HASH
+        BillingMode: PAY_PER_REQUEST 
+
+    UsersTable:
+      Type: AWS::DynamoDB::Table
+      Properties:
+        TableName: Users
+        AttributeDefinitions:
+          - AttributeName: userId
+            AttributeType: S
+          - AttributeName: orgId 
+            AttributeType: S
+        KeySchema:
+          - AttributeName: userId
+            KeyType: HASH
+    
+        GlobalSecondaryIndexes:
+          - IndexName: OrgId-index
+            KeySchema:
+              - AttributeName: orgId
+                KeyType: HASH
+            Projection:
+              ProjectionType: ALL 
+        BillingMode: PAY_PER_REQUEST 
+
+custom:
+  serverless-offline:
+    httpPort: 3000
+  dynamodb:
+    start:
+      port: 8000
+      inMemory: true
+      migrate: true # Автоматично створювати таблиці при запуску локально
+    stages:
+      - dev # Запускати DynamoDB Local тільки для стадії 'dev' (локальна розробка)
+
+package: 
+  individually: true 
+  patterns: 
+    - '!node_modules/**' 
+    - '!package.json' 
+    - '!README.md' 
+    - '!.git/**' 
+    - '!.gitignore' 
+    - '!.dynamodb/**' 
+    - '!.*'  
+    - '!.serverless/**' 
+    - 'node_modules/**' 
