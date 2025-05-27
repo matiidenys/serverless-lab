@@ -7,9 +7,11 @@ const { v4: uuidv4 } = require('uuid'); // Для генерації уніка�
 const IS_OFFLINE = process.env.IS_OFFLINE;
 // Порт DynamoDB Local
 const DYNAMODB_LOCAL_PORT = process.env.DYNAMODB_LOCAL_PORT || 8000;
+const ORGANIZATION_USER_QUEUE_URL = process.env.ORGANIZATION_USER_QUEUE_URL;
 
 
 let dynamoDb;
+let sqs;
 
 // Якщо ми працюємо офлайн, явно вказуємо ендпоінт та фіктивні облікові дані.
 // Це примусить AWS SDK використовувати локальний DynamoDB без валідації реальних credentials.
@@ -21,9 +23,16 @@ if (IS_OFFLINE) {
         accessKeyId: 'test',
         secretAccessKey: 'test',
     });
+    sqs = new AWS.SQS({
+        region: 'localhost',
+        endpoint: `http://localhost:9324`, // Типовий порт для localstack/elasticmq SQS
+        accessKeyId: 'test',
+        secretAccessKey: 'test',
+    });
 } else {
     // Для розгортання в AWS, AWS SDK автоматично підтягне конфігурацію з середовища Lambda
     dynamoDb = new AWS.DynamoDB.DocumentClient();
+    sqs = new AWS.SQS();
 }
 
 // Назви таблиць з environment variables (або значення за замовчуванням)
@@ -55,7 +64,7 @@ module.exports.createOrganization = async (event) => {
             return buildResponse(400, { message: 'Назва та опис організації є обов\'язковими.' });
         }
 
-        // Перевірка на унікальність назви організації
+        // Перевірка на унікальність назви організації (синхронно, щоб уникнути дублікатів в черзі)
         const scanParams = {
             TableName: ORGANIZATIONS_TABLE,
             FilterExpression: '#name = :name',
@@ -69,23 +78,22 @@ module.exports.createOrganization = async (event) => {
         }
 
         const orgId = uuidv4(); // Генеруємо унікальний ID для організації
-        const newOrganization = {
-            orgId: orgId,
-            name: name,
-            description: description,
-            createdAt: new Date().toISOString(),
-            updatedAt: new Date().toISOString(),
+
+        // Створюємо повідомлення для SQS
+        const message = {
+            operation: 'createOrganization', // Тип операції для споживача
+            data: { orgId, name, description, createdAt: new Date().toISOString(), updatedAt: new Date().toISOString() }
         };
 
-        const params = {
-            TableName: ORGANIZATIONS_TABLE,
-            Item: newOrganization,
+        const sqsParams = {
+            QueueUrl: ORGANIZATION_USER_QUEUE_URL,
+            MessageBody: JSON.stringify(message)
         };
 
-        await dynamoDb.put(params).promise();
-        console.log('Організація успішно створена:', newOrganization);
+        await sqs.sendMessage(sqsParams).promise();
 
-        return buildResponse(201, { message: 'Організація успішно створена.', organization: newOrganization });
+        console.log('Повідомлення про створення організації відправлено в SQS:', message);
+        return buildResponse(202, { message: 'Запит на створення організації прийнято, обробляється асинхронно.', orgId: orgId });
 
     } catch (error) {
         console.error('Помилка при створенні організації:', error);
@@ -95,176 +103,123 @@ module.exports.createOrganization = async (event) => {
 
 // 2. Функція для створення/оновлення користувача (POST/PUT /organizations/{orgId}/users)
 module.exports.createOrUpdateUser = async (event) => {
-  console.log('Виклик createOrUpdateUser');
-  console.log('Отримано подію:', JSON.stringify(event));
+    console.log('Виклик createOrUpdateUser');
+    console.log('Отримано подію:', JSON.stringify(event));
 
-  try {
-      const { orgId } = event.pathParameters; // Отримуємо orgId з URL шляху
-      const data = JSON.parse(event.body);
-      const { name, email, userId } = data; // userId може бути в тілі для PUT-запиту
+    try {
+        const { orgId } = event.pathParameters;
+        const data = JSON.parse(event.body);
+        const { userId, name, email } = data;
 
-      // Валідація вхідних даних
-      if (!orgId || !name || !email) {
-          return buildResponse(400, { message: 'orgId у шляху, ім\'я та email користувача є обов\'язковими.' });
-      }
+        // Валідація вхідних даних
+        if (!orgId || !name || !email) {
+            return buildResponse(400, { message: 'orgId у шляху, ім\'я та email користувача є обов\'язковими.' });
+        }
 
-      // Перевіряємо, чи існує організація з таким orgId
-      const orgGetParams = {
-          TableName: ORGANIZATIONS_TABLE,
-          Key: { orgId: orgId },
-      };
-      const orgResult = await dynamoDb.get(orgGetParams).promise();
+        // Перевіряємо, чи існує організація з таким orgId (синхронно, перед відправкою в SQS)
+        const orgGetParams = {
+            TableName: ORGANIZATIONS_TABLE,
+            Key: { orgId: orgId },
+        };
+        const orgResult = await dynamoDb.get(orgGetParams).promise();
 
-      if (!orgResult.Item) {
-          return buildResponse(404, { message: `Організація з ID '${orgId}' не знайдена.` });
-      }
+        if (!orgResult.Item) {
+            return buildResponse(404, { message: `Організація з ID '${orgId}' не знайдена.` });
+        }
 
-      // Логіка для PUT-запиту (оновлення користувача)
-      if (event.requestContext.http.method === 'PUT') {
-          if (!userId) {
-              return buildResponse(400, { message: 'Для оновлення користувача userId є обов\'язковим у тілі запиту.' });
-          }
+        const newUserId = userId || uuidv4(); // Використовуємо існуючий userId або генеруємо новий
 
-          // Перевіряємо, чи існує користувач з таким userId в даній організації
-          const userGetParams = {
-              TableName: USERS_TABLE,
-              Key: { userId: userId },
-          };
-          const existingUserResult = await dynamoDb.get(userGetParams).promise();
+        // Перевірка на унікальність email в межах організації
+        // Це робимо синхронно, щоб уникнути створення дублікатів в черзі
+        const queryParams = {
+            TableName: USERS_TABLE,
+            IndexName: 'OrgId-index',
+            KeyConditionExpression: 'orgId = :orgId',
+            FilterExpression: 'email = :email',
+            ExpressionAttributeValues: {
+                ':orgId': orgId,
+                ':email': email
+            },
+        };
+        const queryResult = await dynamoDb.query(queryParams).promise();
 
-          if (!existingUserResult.Item || existingUserResult.Item.orgId !== orgId) {
-              return buildResponse(404, { message: `Користувач з ID '${userId}' не знайдений в організації '${orgId}'.` });
-          }
+        if (queryResult.Items && queryResult.Items.length > 0) {
+            const existingUser = queryResult.Items[0];
+            if (event.requestContext.http.method === 'POST' || (event.requestContext.http.method === 'PUT' && existingUser.userId !== newUserId)) {
+                 return buildResponse(409, { message: `Користувач з email '${email}' вже зареєстрований в цій організації.` });
+            }
+        }
+        
+        // Створюємо повідомлення для SQS
+        const message = {
+            operation: event.requestContext.http.method === 'POST' ? 'createUser' : 'updateUser',
+            data: { orgId, userId: newUserId, name, email, createdAt: new Date().toISOString(), updatedAt: new Date().toISOString() }
+        };
 
-          // Оновлюємо дані користувача
-          const updateUserParams = {
-              TableName: USERS_TABLE,
-              Key: { userId: userId },
-              UpdateExpression: 'SET #name = :name, email = :email, updatedAt = :updatedAt',
-              ExpressionAttributeNames: { '#name': 'name' },
-              ExpressionAttributeValues: {
-                  ':name': name,
-                  ':email': email,
-                  ':updatedAt': new Date().toISOString(),
-              },
-              ReturnValues: 'ALL_NEW', // Повертаємо оновлений об'єкт
-          };
-          const updatedUser = await dynamoDb.update(updateUserParams).promise();
+        const sqsParams = {
+            QueueUrl: ORGANIZATION_USER_QUEUE_URL,
+            MessageBody: JSON.stringify(message)
+        };
 
-          console.log('Користувач успішно оновлений:', updatedUser.Attributes);
-          return buildResponse(200, { message: 'Користувач успішно оновлений.', user: updatedUser.Attributes });
+        await sqs.sendMessage(sqsParams).promise();
 
-      } else { // Логіка для POST-запиту (створення нового користувача)
-          // Перевіряємо унікальність email в рамках даної організації
-          // Для цього використовуємо Global Secondary Index (GSI) OrgId-index
-          const queryParams = {
-              TableName: USERS_TABLE,
-              IndexName: 'OrgId-index', // Назва нашого GSI з serverless.yml
-              KeyConditionExpression: 'orgId = :orgId',
-              FilterExpression: 'email = :email', // Фільтруємо за email в межах orgId
-              ExpressionAttributeValues: {
-                  ':orgId': orgId,
-                  ':email': email,
-              },
-          };
-          const existingUsersWithEmail = await dynamoDb.query(queryParams).promise();
+        console.log('Повідомлення про користувача відправлено в SQS:', message);
+        return buildResponse(202, { message: `Запит на ${event.requestContext.http.method === 'POST' ? 'створення' : 'оновлення'} користувача прийнято, обробляється асинхронно.`, userId: newUserId });
 
-          if (existingUsersWithEmail.Items && existingUsersWithEmail.Items.length > 0) {
-              return buildResponse(409, { message: 'Користувач з таким email вже зареєстрований в цій організації.' });
-          }
-
-          const newUserId = uuidv4(); // Генеруємо унікальний ID для нового користувача
-          const newUser = {
-              userId: newUserId,
-              orgId: orgId, // Зв'язуємо користувача з організацією
-              name: name,
-              email: email,
-              createdAt: new Date().toISOString(),
-              updatedAt: new Date().toISOString(),
-          };
-
-          const putUserParams = {
-              TableName: USERS_TABLE,
-              Item: newUser,
-          };
-
-          await dynamoDb.put(putUserParams).promise();
-          console.log('Користувач успішно зареєстрований:', newUser);
-
-          return buildResponse(201, { message: 'Користувач успішно зареєстрований.', user: newUser });
-      }
-
-  } catch (error) {
-      console.error('Помилка при створенні/оновленні користувача:', error);
-      return buildResponse(500, { message: 'Внутрішня помилка сервера.', error: error.message });
-  }
+    } catch (error) {
+        console.error('Помилка при створенні/оновленні користувача:', error);
+        return buildResponse(500, { message: 'Внутрішня помилка сервера.', error: error.message });
+    }
 };
 
 // 3. Функція для оновлення організації (PUT /organizations)
 module.exports.updateOrganization = async (event) => {
-  console.log('Виклик updateOrganization');
-  console.log('Отримано подію:', JSON.stringify(event));
+    console.log('Виклик updateOrganization');
+    console.log('Отримано подію:', JSON.stringify(event));
 
-  try {
-      const data = JSON.parse(event.body);
-      const { orgId, name, description } = data; // orgId, name, description очікуються в тілі запиту
+    try {
+        const data = JSON.parse(event.body);
+        const { orgId, name, description } = data;
 
-      // Валідація вхідних даних
-      if (!orgId) {
-          return buildResponse(400, { message: 'orgId є обов\'язковим для оновлення організації.' });
-      }
-      if (!name && !description) {
-          return buildResponse(400, { message: 'Назва або опис організації є обов\'язковими для оновлення.' });
-      }
+        // Валідація вхідних даних
+        if (!orgId) {
+            return buildResponse(400, { message: 'orgId є обов\'язковим для оновлення організації.' });
+        }
+        if (!name && !description) {
+            return buildResponse(400, { message: 'Назва або опис організації є обов\'язковими для оновлення.' });
+        }
 
-      // Перевіряємо, чи існує організація з таким orgId
-      const orgGetParams = {
-          TableName: ORGANIZATIONS_TABLE,
-          Key: { orgId: orgId },
-      };
-      const orgResult = await dynamoDb.get(orgGetParams).promise();
+        // Перевіряємо, чи існує організація з таким orgId (синхронно, перед відправкою в SQS)
+        const orgGetParams = {
+            TableName: ORGANIZATIONS_TABLE,
+            Key: { orgId: orgId },
+        };
+        const orgResult = await dynamoDb.get(orgGetParams).promise();
 
-      if (!orgResult.Item) {
-          return buildResponse(404, { message: `Організація з ID '${orgId}' не знайдена.` });
-      }
+        if (!orgResult.Item) {
+            return buildResponse(404, { message: `Організація з ID '${orgId}' не знайдена для оновлення.` });
+        }
 
-      // Побудова UpdateExpression та ExpressionAttributeValues
-      const updateExpressionParts = [];
-      const expressionAttributeValues = {};
-      const expressionAttributeNames = {}; // Додаємо ExpressionAttributeNames для зарезервованих слів
+        // Створюємо повідомлення для SQS
+        const message = {
+            operation: 'updateOrganization', // Тип операції для споживача
+            data: { orgId, name, description, updatedAt: new Date().toISOString() }
+        };
 
-      if (name) {
-          updateExpressionParts.push('#name = :name');
-          expressionAttributeValues[':name'] = name;
-          expressionAttributeNames['#name'] = 'name'; // 'name' є зарезервованим словом у DynamoDB
-      }
-      if (description) {
-          updateExpressionParts.push('description = :description');
-          expressionAttributeValues[':description'] = description;
-      }
+        const sqsParams = {
+            QueueUrl: ORGANIZATION_USER_QUEUE_URL,
+            MessageBody: JSON.stringify(message)
+        };
 
-      // Додаємо оновлення updatedAt
-      updateExpressionParts.push('updatedAt = :updatedAt');
-      expressionAttributeValues[':updatedAt'] = new Date().toISOString();
+        await sqs.sendMessage(sqsParams).promise();
 
-      const updateParams = {
-          TableName: ORGANIZATIONS_TABLE,
-          Key: { orgId: orgId },
-          UpdateExpression: `SET ${updateExpressionParts.join(', ')}`,
-          ExpressionAttributeValues: expressionAttributeValues,
-          ...(Object.keys(expressionAttributeNames).length > 0 && { ExpressionAttributeNames: expressionAttributeNames }),
-          ReturnValues: 'ALL_NEW', // Повертаємо оновлений об'єкт
-      };
+        console.log('Повідомлення про оновлення організації відправлено в SQS:', message);
+        return buildResponse(202, { message: 'Запит на оновлення організації прийнято, обробляється асинхронно.', orgId: orgId });
 
-      const updatedOrganization = await dynamoDb.update(updateParams).promise();
-
-      console.log('Організація успішно оновлена:', updatedOrganization.Attributes);
-      return buildResponse(200, { message: 'Організація успішно оновлена.', organization: updatedOrganization.Attributes });
-
-  } catch (error) {
-      console.error('Помилка при оновленні організації:', error);
-      return buildResponse(500, { message: 'Внутрішня помилка сервера.', error: error.message });
-  }
+    } catch (error) {
+        console.error('Помилка при оновленні організації:', error);
+        return buildResponse(500, { message: 'Внутрішня помилка сервера.', error: error.message });
+    }
 };
 
 // 4. Функція для отримання організації за ID (GET /organizations/{orgId})
@@ -405,4 +360,125 @@ module.exports.getAllUsersByOrganization = async (event) => {
       console.error('Помилка при отриманні користувачів за організацією:', error);
       return buildResponse(500, { message: 'Внутрішня помилка сервера.', error: error.message });
   }
+};
+
+
+// 8. Функція для обробки повідомлень з SQS (Consumer Lambda)
+module.exports.processSqsMessages = async (event) => {
+    console.log('Виклик processSqsMessages - Отримано повідомлення з SQS');
+    console.log('Подія SQS:', JSON.stringify(event, null, 2));
+
+    for (const record of event.Records) {
+        try {
+            const messageBody = JSON.parse(record.body);
+            const { operation, data } = messageBody;
+
+            console.log(`Обробка повідомлення: Операція=${operation}, Дані=`, data);
+
+            let params;
+            let result;
+
+            switch (operation) {
+                case 'createOrganization':
+                    params = {
+                        TableName: ORGANIZATIONS_TABLE,
+                        Item: {
+                            orgId: data.orgId,
+                            name: data.name,
+                            description: data.description,
+                            createdAt: data.createdAt,
+                            updatedAt: data.updatedAt,
+                        },
+                    };
+                    await dynamoDb.put(params).promise();
+                    console.log('Організація успішно створена з SQS:', data);
+                    break;
+
+                case 'updateOrganization':
+                    const updateOrgExpressionParts = [];
+                    const updateOrgExpressionAttributeValues = {};
+                    const updateOrgExpressionAttributeNames = {};
+
+                    if (data.name) {
+                        updateOrgExpressionParts.push('#orgName = :orgName');
+                        updateOrgExpressionAttributeValues[':orgName'] = data.name;
+                        updateOrgExpressionAttributeNames['#orgName'] = 'name';
+                    }
+                    if (data.description) {
+                        updateOrgExpressionParts.push('description = :description');
+                        updateOrgExpressionAttributeValues[':description'] = data.description;
+                    }
+
+                    updateOrgExpressionParts.push('updatedAt = :updatedAt');
+                    updateOrgExpressionAttributeValues[':updatedAt'] = data.updatedAt;
+
+                    params = {
+                        TableName: ORGANIZATIONS_TABLE,
+                        Key: { orgId: data.orgId },
+                        UpdateExpression: `SET ${updateOrgExpressionParts.join(', ')}`,
+                        ExpressionAttributeValues: updateOrgExpressionAttributeValues,
+                        ...(Object.keys(updateOrgExpressionAttributeNames).length > 0 && { ExpressionAttributeNames: updateOrgExpressionAttributeNames }),
+                        ReturnValues: 'UPDATED_NEW',
+                    };
+                    await dynamoDb.update(params).promise();
+                    console.log('Організація успішно оновлена з SQS:', data);
+                    break;
+
+                case 'createUser':
+                    params = {
+                        TableName: USERS_TABLE,
+                        Item: {
+                            userId: data.userId,
+                            orgId: data.orgId,
+                            name: data.name,
+                            email: data.email,
+                            createdAt: data.createdAt,
+                            updatedAt: data.updatedAt,
+                        },
+                    };
+                    await dynamoDb.put(params).promise();
+                    console.log('Користувач успішно створений з SQS:', data);
+                    break;
+
+                case 'updateUser':
+                    // Для оновлення користувача ми припускаємо, що userId є в `data`
+                    const updateUserExpressionParts = [];
+                    const updateUserExpressionAttributeValues = {};
+                    const updateUserExpressionAttributeNames = {};
+
+                    if (data.name) {
+                        updateUserExpressionParts.push('#userName = :userName');
+                        updateUserExpressionAttributeValues[':userName'] = data.name;
+                        updateUserExpressionAttributeNames['#userName'] = 'name';
+                    }
+                    if (data.email) {
+                        updateUserExpressionParts.push('email = :email');
+                        updateUserExpressionAttributeValues[':email'] = data.email;
+                    }
+
+                    updateUserExpressionParts.push('updatedAt = :updatedAt');
+                    updateUserExpressionAttributeValues[':updatedAt'] = data.updatedAt;
+
+                    params = {
+                        TableName: USERS_TABLE,
+                        Key: { userId: data.userId },
+                        UpdateExpression: `SET ${updateUserExpressionParts.join(', ')}`,
+                        ExpressionAttributeValues: updateUserExpressionAttributeValues,
+                        ...(Object.keys(updateUserExpressionAttributeNames).length > 0 && { ExpressionAttributeNames: updateUserExpressionAttributeNames }),
+                        ReturnValues: 'UPDATED_NEW',
+                    };
+                    await dynamoDb.update(params).promise();
+                    console.log('Користувач успішно оновлений з SQS:', data);
+                    break;
+
+                default:
+                    console.warn(`Невідома операція: ${operation}. Пропускаємо повідомлення.`);
+            }
+        } catch (error) {
+            console.error('Помилка при обробці SQS повідомлення:', record.body, error);
+
+            throw error; // Перекидаємо помилку, щоб SQS не видалив повідомлення з черги
+        }
+    }
+    return { statusCode: 200, body: 'SQS повідомлення оброблені успішно.' };
 };

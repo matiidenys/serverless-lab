@@ -6,6 +6,11 @@ provider:
   name: aws
   runtime: nodejs20.x
   region: eu-north-1 
+  environment:
+    ORGANIZATIONS_TABLE: Organizations
+    USERS_TABLE: Users
+    ORGANIZATION_USER_QUEUE_URL:
+      Ref: OrganizationUserQueue 
 
   iam:
     role:
@@ -33,7 +38,18 @@ provider:
           Action:
             - dynamodb:Query
           Resource: "arn:aws:dynamodb:${aws:region}:${aws:accountId}:table/Users/index/OrgId-index"
-
+        - Effect: Allow
+          Action:
+            - sqs:SendMessage # Дозвіл на відправку повідомлень
+          Resource:
+            Fn::GetAtt: [ OrganizationUserQueue, Arn ] # ARN нашої SQS черги
+        - Effect: Allow
+          Action:
+            - sqs:ReceiveMessage # Дозвіл на отримання повідомлень
+            - sqs:DeleteMessage # Дозвіл на видалення повідомлень після обробки
+            - sqs:GetQueueAttributes # Може знадобитися для деяких операцій
+          Resource:
+            Fn::GetAtt: [ OrganizationUserQueue, Arn ]
 plugins:
   - serverless-dynamodb 
   - serverless-offline
@@ -87,6 +103,15 @@ functions:
       - httpApi:
           path: /organizations/{orgId}/users
           method: get
+  processSqsMessages: # Нова функція-споживач SQS
+    handler: handler.processSqsMessages
+    events:
+      - sqs:
+          arn:
+            Fn::GetAtt: [ OrganizationUserQueue, Arn ] # Посилання на ARN нашої SQS черги
+          batchSize: 10 # Скільки повідомлень Lambda буде брати за один раз (до 10)
+          enabled: true 
+
 
 # Конфігурація DynamoDB таблиць для локального використання та розгортання
 resources:
@@ -124,6 +149,13 @@ resources:
             Projection:
               ProjectionType: ALL 
         BillingMode: PAY_PER_REQUEST 
+    OrganizationUserQueue: # Назва логічного ресурсу в CloudFormation
+      Type: AWS::SQS::Queue
+      Properties:
+        QueueName: OrganizationUserQueue-${sls:stage} # Унікальна назва черги 
+        VisibilityTimeout: 300 # Таймаут видимості повідомлень у секундах
+        MessageRetentionPeriod: 345600 # Час зберігання повідомлень, теж секунди. 4 дні
+
 
 custom:
   serverless-offline:
